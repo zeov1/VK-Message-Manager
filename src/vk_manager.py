@@ -1,4 +1,8 @@
-"""High-level operations for VK messages and conversations."""
+"""High-level operations for VK messages and conversations.
+
+All destructive operations in this module are restricted to messages
+authored by the current user (the owner of the access token).
+"""
 
 from __future__ import annotations
 
@@ -8,18 +12,40 @@ from vk_client import VKClient
 
 CHAT_PEER_OFFSET = 2_000_000_000
 MAX_HISTORY_BATCH = 100
+# MAX_HISTORY_BATCH = 3
 
 
 class VKMessageManager:
-    """Domain layer on top of :class:`VKClient`."""
+    """Domain layer on top of :class:`VKClient`.
+
+    Every method that deletes messages only ever touches messages whose
+    ``from_id`` equals the current user's ID. Messages written by other
+    participants are never deleted.
+    """
 
     def __init__(self, client: VKClient) -> None:
-        """Store the API client.
+        """Store the API client and prepare the identity cache.
 
         Args:
             client: Configured :class:`VKClient` instance.
         """
         self._client = client
+        self._user_id: int | None = None
+
+    # ------------------------------------------------------------------ identity
+
+    def get_current_user_id(self) -> int:
+        """Return the ID of the token owner.
+
+        The result is cached after the first call.
+
+        Returns:
+            The numeric VK user ID associated with the access token.
+        """
+        if self._user_id is None:
+            response = self._client.call("users.get")
+            self._user_id = response[0]["id"]
+        return self._user_id
 
     # ------------------------------------------------------------------ helpers
 
@@ -30,7 +56,17 @@ class VKMessageManager:
         profiles: dict[int, dict[str, Any]],
         groups: dict[int, dict[str, Any]],
     ) -> str:
-        """Resolve a human-readable name for a conversation peer."""
+        """Resolve a human-readable name for a conversation peer.
+
+        Args:
+            peer_id: Conversation peer identifier.
+            conversation: Conversation object from the API response.
+            profiles: Map of user id to user object.
+            groups: Map of community id to community object.
+
+        Returns:
+            Display name for the peer.
+        """
         if 0 < peer_id < CHAT_PEER_OFFSET:
             user = profiles.get(peer_id)
             if user:
@@ -50,13 +86,54 @@ class VKMessageManager:
     @staticmethod
     def _index_profiles(
         response: dict[str, Any],
-    ) -> tuple[dict[int, dict], dict[int, dict]]:
-        """Build id→object maps for profiles and groups."""
+    ) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+        """Build id to object maps for profiles and groups.
+
+        Args:
+            response: Raw API response containing ``profiles``/``groups``.
+
+        Returns:
+            Tuple of ``(profiles_map, groups_map)``.
+        """
         profiles = {p["id"]: p for p in response.get("profiles", [])}
         groups = {g["id"]: g for g in response.get("groups", [])}
         return profiles, groups
 
-    # ---------------------------------------------------------- conversations
+    def _fetch_history(
+        self, peer_id: int, offset: int, count: int
+    ) -> list[dict[str, Any]]:
+        """Return raw message objects from a conversation.
+
+        Args:
+            peer_id: Conversation peer identifier.
+            offset: Pagination offset into the (current) history.
+            count: Maximum number of messages to return.
+
+        Returns:
+            List of raw message dicts as returned by ``messages.getHistory``.
+        """
+        response = self._client.call(
+            "messages.getHistory", peer_id=peer_id, offset=offset, count=count
+        )
+        return response.get("items", [])
+
+    def _delete_messages(self, peer_id: int, message_ids: list[int]) -> None:
+        """Delete a batch of messages in a single request.
+
+        Args:
+            peer_id: Conversation peer identifier.
+            message_ids: IDs of the messages to delete.
+        """
+        if not message_ids:
+            return
+        self._client.call(
+            "messages.delete",
+            peer_id=peer_id,
+            message_ids=",".join(str(i) for i in message_ids),
+            delete_for_all=1,
+        )
+
+    # -------------------------------------------------------------- conversations
 
     def get_conversations(self, count: int = 200) -> list[tuple[int, str]]:
         """Return ``(peer_id, name)`` pairs for the user's conversations.
@@ -96,7 +173,7 @@ class VKMessageManager:
                 return self._peer_name(peer_id, item, profiles, groups)
         return str(peer_id)
 
-    # --------------------------------------------------------------- messages
+    # -------------------------------------------------------------- read messages
 
     def get_last_messages(self, limit: int = 10) -> list[dict[str, Any]]:
         """Fetch the last ``limit`` messages across all conversations.
@@ -105,7 +182,8 @@ class VKMessageManager:
             limit: Number of recent messages to retrieve.
 
         Returns:
-            A list of dicts with keys ``id``, ``peer_id``, ``conv_name``, ``text``.
+            A list of dicts with keys ``id``, ``peer_id``, ``conv_name``,
+            ``from_id`` and ``text``.
         """
         response = self._client.call(
             "messages.getConversations", count=limit, extended=1
@@ -121,6 +199,7 @@ class VKMessageManager:
                     "id": last.get("id"),
                     "peer_id": peer_id,
                     "conv_name": self._peer_name(peer_id, conv, profiles, groups),
+                    "from_id": last.get("from_id"),
                     "text": last.get("text", ""),
                 }
             )
@@ -136,50 +215,75 @@ class VKMessageManager:
             limit: Maximum number of messages to return.
 
         Returns:
-            A list of dicts with keys ``id`` and ``text``.
+            A list of dicts with keys ``id``, ``from_id`` and ``text``.
         """
-        response = self._client.call(
-            "messages.getHistory", peer_id=peer_id, count=limit
-        )
+        items = self._fetch_history(peer_id, offset=0, count=limit)
         return [
-            {"id": m["id"], "text": m.get("text", "")}
-            for m in response.get("items", [])
+            {"id": m["id"], "from_id": m["from_id"], "text": m.get("text", "")}
+            for m in items
         ]
 
-    # ----------------------------------------------------------------- delete
+    # -------------------------------------------------------------- delete messages
 
     def delete_message(self, message_id: int) -> None:
-        """Delete a single message by its global ID.
+        """Delete a single message authored by the current user.
 
         Args:
-            message_id: Message identifier.
+            message_id: Global message identifier.
 
         Raises:
-            ValueError: If the message could not be found.
+            ValueError: If the message is missing or was not authored
+                by the current user.
         """
         response = self._client.call("messages.getById", message_ids=str(message_id))
         items = response.get("items", [])
         if not items:
             raise ValueError(f"Message {message_id} not found")
-        peer_id = items[0]["peer_id"]
-        self._delete_messages(peer_id, [message_id])
+
+        message = items[0]
+        if message["from_id"] != self.get_current_user_id():
+            raise ValueError(
+                f"Message {message_id} was not authored by you; refusing to delete"
+            )
+
+        self._delete_messages(message["peer_id"], [message_id])
 
     def delete_last_message(self, peer_id: int) -> None:
-        """Delete the most recent message in a conversation.
+        """Delete the most recent message in a conversation authored by you.
+
+        Messages from other participants that happen to be more recent are
+        skipped.
 
         Args:
             peer_id: Conversation peer identifier.
 
         Raises:
-            ValueError: If the conversation has no messages.
+            ValueError: If the conversation contains no messages authored
+                by the current user.
         """
-        messages = self.get_conversation_messages(peer_id, limit=1)
-        if not messages:
-            raise ValueError("Conversation has no messages")
-        self._delete_messages(peer_id, [messages[0]["id"]])
+        my_id = self.get_current_user_id()
+        offset = 0
+
+        while True:
+            batch = self._fetch_history(peer_id, offset, MAX_HISTORY_BATCH)
+            if not batch:
+                break
+
+            for message in batch:
+                if message["from_id"] == my_id:
+                    self._delete_messages(peer_id, [message["id"]])
+                    return
+
+            if len(batch) < MAX_HISTORY_BATCH:
+                break
+            offset += len(batch)
+
+        raise ValueError("No messages authored by you in this conversation")
 
     def delete_all_messages(self, peer_id: int) -> int:
-        """Delete every message in a conversation.
+        """Delete every message authored by the current user in a conversation.
+
+        Messages written by other participants are left untouched.
 
         Args:
             peer_id: Conversation peer identifier.
@@ -187,27 +291,25 @@ class VKMessageManager:
         Returns:
             Number of messages that were deleted.
         """
+        my_id = self.get_current_user_id()
         deleted = 0
-        while True:
-            messages = self.get_conversation_messages(peer_id, limit=MAX_HISTORY_BATCH)
-            ids = [m["id"] for m in messages]
-            if not ids:
-                break
-            self._delete_messages(peer_id, ids)
-            deleted += len(ids)
-            if len(ids) < MAX_HISTORY_BATCH:
-                break
-        return deleted
+        offset = 0
 
-    def _delete_messages(
-        self, peer_id: int, message_ids: list[int], for_all: bool = True
-    ) -> None:
-        """Delete a batch of messages in a single request."""
-        if not message_ids:
-            return
-        self._client.call(
-            "messages.delete",
-            peer_id=peer_id,
-            message_ids=",".join(str(i) for i in message_ids),
-            delete_for_all=1 if for_all else 0,
-        )
+        while True:
+            batch = self._fetch_history(peer_id, offset, MAX_HISTORY_BATCH)
+            if not batch:
+                break
+
+            mine = [m["id"] for m in batch if m["from_id"] == my_id]
+            if mine:
+                self._delete_messages(peer_id, mine)
+                deleted += len(mine)
+
+            if len(batch) < MAX_HISTORY_BATCH:
+                break
+
+            # Deleted messages shift the remaining history back, so advance
+            # the offset only by the messages that were *not* deleted.
+            offset += len(batch) - len(mine)
+
+        return deleted
