@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from typing import Any
@@ -12,6 +13,7 @@ from vk_manager import MAX_HISTORY_BATCH, VKMessageManager
 MAIN_MENU = """\
 1) Choose conversation
 2) Print all conversations
+3) Call custom API method
 0) Exit
 """
 
@@ -71,11 +73,8 @@ def _format_duration(seconds: float) -> str:
 
 
 def _print_conversations(manager: VKMessageManager) -> None:
+    """Fetch and print the user's conversations with 1-based indices."""
     conversations = manager.get_conversations()
-    if not conversations:
-        print("(no conversations)")
-        return
-
     if not conversations:
         print("(no conversations)")
         return
@@ -145,7 +144,6 @@ def _choose_conversation(
             return None
         conversation = manager.get_conversation_name(index)
         return (index, conversation)
-        print("Out of range.")
 
 
 def _run_conversation_menu(manager: VKMessageManager, peer_id: int, name: str) -> None:
@@ -205,6 +203,51 @@ def _run_conversation_menu(manager: VKMessageManager, peer_id: int, name: str) -
             print(f"Error: {err}")
 
 
+def _parse_param_value(raw: str) -> Any:
+    """Coerce a raw parameter value to int when possible, else keep it as str."""
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def _run_custom_api(manager: VKMessageManager) -> None:
+    """Interactively call an arbitrary VK API method.
+
+    Prompts for the method name, then repeatedly asks for parameter
+    name/value pairs until the user submits an empty parameter name. The
+    collected parameters are sent as-is and the raw JSON response is printed.
+
+    Args:
+        manager: Configured :class:`VKMessageManager`.
+    """
+    method = input("API method (e.g. messages.search): ").strip()
+    if not method:
+        print("Cancelled.")
+        return
+
+    params: dict[str, Any] = {}
+    print(
+        "Enter parameter name/value pairs one at a time.\n"
+        "Submit an empty parameter name to send the request."
+    )
+    while True:
+        name = input("  Param name (empty to send): ").strip()
+        if not name:
+            break
+        value = input(f"  Value for '{name}': ").strip()
+        params[name] = _parse_param_value(value)
+
+    print(f"\nCalling {method} with params={params} ...")
+    try:
+        response = manager.call_raw(method, **params)
+    except VKAPIError as err:
+        print(f"VK API error: {err}")
+        return
+
+    print(json.dumps(response, indent=2, ensure_ascii=False))
+
+
 def _run(manager: VKMessageManager) -> None:
     """Run the top-level CLI loop.
 
@@ -234,7 +277,8 @@ def _run(manager: VKMessageManager) -> None:
                     print(f"VK API error: {err}")
                 except ValueError as err:
                     print(f"Error: {err}")
-
+            case "3":
+                _run_custom_api(manager)
             case "0":
                 print("Bye.")
                 return

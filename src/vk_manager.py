@@ -360,3 +360,15 @@ class VKMessageManager:
             offset += len(batch) - len(mine)
 
         return deleted
+
+    def call_raw(self, method: str, **params: Any) -> Any:
+        """Call an arbitrary VK API method and return the raw response.
+
+        Args:
+            method: Full VK method name, e.g. ``"messages.search"``.
+            **params: Method parameters, passed as form fields.
+
+        Returns:
+            The ``response`` payload from the API.
+        """
+        return self._client.call(method, **params)
