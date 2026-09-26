@@ -14,6 +14,7 @@ MAIN_MENU = """\
 1) Choose conversation
 2) Print all conversations
 3) Call custom API method
+4) Remove all messages in multiple conversations
 0) Exit
 """
 
@@ -131,6 +132,14 @@ def _choose_conversation(
         ``(peer_id, name)`` of the chosen conversation, or ``None`` if the
         user cancelled.
     """
+    conversations = manager.get_conversations()
+    if not conversations:
+        print("(no conversations)")
+        return None
+
+    for index, (peer_id, name) in enumerate(conversations, start=1):
+        print(f"{index:>3}) [{peer_id}] {name}")
+
     while True:
         raw = input("Choose conversation number (0 to cancel): ").strip()
         if not raw:
@@ -142,8 +151,9 @@ def _choose_conversation(
             continue
         if index == 0:
             return None
-        conversation = manager.get_conversation_name(index)
-        return (index, conversation)
+        if 1 <= index <= len(conversations):
+            return conversations[index - 1]
+        print(f"Out of range (1-{len(conversations)}).")
 
 
 def _run_conversation_menu(manager: VKMessageManager, peer_id: int, name: str) -> None:
@@ -248,6 +258,78 @@ def _run_custom_api(manager: VKMessageManager) -> None:
     print(json.dumps(response, indent=2, ensure_ascii=False))
 
 
+def _run_bulk_delete(manager: VKMessageManager) -> None:
+    """Delete every own message across a user-supplied list of conversations.
+
+    Prompts for conversation peer IDs one at a time; an empty line ends
+    the list. After a single confirmation, deletes all messages authored
+    by the current user in each listed conversation. A failure in one
+    conversation does not abort the rest of the batch.
+
+    Args:
+        manager: Configured :class:`VKMessageManager`.
+    """
+    peers: dict[int, str] = {}  # peer_id: name
+    print("Enter conversation peer IDs one at a time.\nSubmit an empty line to finish.")
+    while True:
+        raw = input("  Peer ID (empty to finish): ").strip()
+        if not raw:
+            break
+        try:
+            peer_id = int(raw)
+            name = manager.get_conversation_name(peer_id)
+            peers[peer_id] = name
+        except ValueError:
+            print(f"Wrong peer ID: {raw}")
+
+    if not peers:
+        print("No conversations specified. Cancelled.")
+        return
+
+    print("Selected conversations:")
+    for index, (pid, pname) in enumerate(peers.items()):
+        print(f"{index:>2}. [{pid}], {pname}")
+
+    confirm = (
+        input(
+            f"\nThis will delete ALL your messages in {len(peers)} "
+            "conversation(s). Type 'yes' to confirm: "
+        )
+        .strip()
+        .lower()
+    )
+    if confirm != "yes":
+        print("Cancelled.")
+        return
+
+    start = time.monotonic()
+    total = 0
+    for index, (peer_id, name) in enumerate(peers.items(), start=1):
+        header = f"[{index}/{len(peers)}] ID={peer_id}"
+        try:
+            header = f"[{index}/{len(peers)}] {name} (ID={peer_id})"
+        except VKAPIError as err:
+            print(f"\n{header}\n  VK API error while resolving name: {err}")
+            continue
+
+        print(f"\n{header}")
+        progress = _make_progress_printer("Deleted")
+        try:
+            deleted = manager.delete_all_messages(peer_id, progress=progress)
+        except VKAPIError as err:
+            print(f"  VK API error: {err}")
+            continue
+        except ValueError as err:
+            print(f"  Error: {err}")
+            continue
+
+        total += deleted
+        print(f"  Deleted {deleted} message(s).")
+
+    elapsed = time.monotonic() - start
+    print(f"\nDone. Total deleted: {total} message(s) in {_format_duration(elapsed)}.")
+
+
 def _run(manager: VKMessageManager) -> None:
     """Run the top-level CLI loop.
 
@@ -279,6 +361,8 @@ def _run(manager: VKMessageManager) -> None:
                     print(f"Error: {err}")
             case "3":
                 _run_custom_api(manager)
+            case "4":
+                _run_bulk_delete(manager)
             case "0":
                 print("Bye.")
                 return
