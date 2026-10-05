@@ -7,6 +7,8 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+import requests
+
 from vk_client import VKAPIError, VKClient
 from vk_manager import MAX_HISTORY_BATCH, VKMessageManager
 
@@ -15,6 +17,7 @@ MAIN_MENU = """\
 2) Print all conversations
 3) Call custom API method
 4) Remove all messages in multiple conversations
+5) Export conversation to HTML
 0) Exit
 """
 
@@ -27,6 +30,7 @@ CONVERSATION_MENU = """\
 
 DEFAULT_N = 5
 PROGRESS_STEP = 1000
+EXPORT_ALL = -1
 
 
 # ------------------------------------------------------------------------- input
@@ -62,6 +66,50 @@ def _prompt_n(default: int = DEFAULT_N) -> int:
     return n
 
 
+def _prompt_peer_id() -> int | None:
+    """Ask for a peer ID until it is a valid integer.
+
+    Returns:
+        The peer ID, or ``None`` if the user submitted an empty line.
+    """
+    while True:
+        raw = input("Peer ID (empty to cancel): ").strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            print("Please enter a valid integer.")
+
+
+def _prompt_yes_no(prompt: str, default: bool = False) -> bool:
+    """Ask a y/n question; an empty answer returns ``default``."""
+    hint = "Y/n" if default else "y/N"
+    while True:
+        raw = input(f"{prompt} ({hint}): ").strip().lower()
+        if not raw:
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("Please answer 'y' or 'n'.")
+
+
+def _prompt_export_count() -> int:
+    """Ask how many latest messages to export (``-1`` means all)."""
+    while True:
+        raw = input("Messages count [default=-1 (save all)]: ").strip()
+        if not raw:
+            return EXPORT_ALL
+        try:
+            n = int(raw)
+        except ValueError:
+            print("Please enter a valid integer.")
+            continue
+        return n if n > 0 else EXPORT_ALL
+
+
 # ----------------------------------------------------------------------- output
 
 
@@ -95,7 +143,7 @@ def _print_messages(messages: list[dict[str, Any]]) -> None:
 
 
 def _make_progress_printer(label: str = "Deleted") -> Callable[[int], None]:
-    """Return a callback that prints progress once per ``PROGRESS_STEP`` deletes.
+    """Return a callback that prints progress once per ``PROGRESS_STEP`` items.
 
     Args:
         label: Word printed before the running counter.
@@ -330,6 +378,47 @@ def _run_bulk_delete(manager: VKMessageManager) -> None:
     print(f"\nDone. Total deleted: {total} message(s) in {_format_duration(elapsed)}.")
 
 
+def _run_export(manager: VKMessageManager) -> None:
+    """Export a whole conversation (or its last N messages) to an HTML file.
+
+    Asks for the peer ID, whether attachments should be saved (not
+    implemented yet) and how many latest messages to export. Attachments
+    are written to the file as links.
+
+    Args:
+        manager: Configured :class:`VKMessageManager`.
+    """
+    peer_id = _prompt_peer_id()
+    if peer_id is None:
+        print("Cancelled.")
+        return
+
+    if _prompt_yes_no("Save attachments", default=False):
+        print("Not implemented yet.")
+        return
+
+    count = _prompt_export_count()
+
+    start = time.monotonic()
+    progress = _make_progress_printer("Fetched")
+    try:
+        path, exported = manager.export_conversation_html(
+            peer_id, limit=count, save_attachments=False, progress=progress
+        )
+    except NotImplementedError as err:
+        print(err)
+        return
+    except VKAPIError as err:
+        print(f"VK API error: {err}")
+        return
+    except requests.RequestException as err:
+        print(f"Network error: {err}")
+        return
+
+    elapsed = time.monotonic() - start
+    print(f"Exported {exported} message(s) to {path} in {_format_duration(elapsed)}.")
+
+
 def _run(manager: VKMessageManager) -> None:
     """Run the top-level CLI loop.
 
@@ -363,6 +452,8 @@ def _run(manager: VKMessageManager) -> None:
                 _run_custom_api(manager)
             case "4":
                 _run_bulk_delete(manager)
+            case "5":
+                _run_export(manager)
             case "0":
                 print("Bye.")
                 return
