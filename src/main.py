@@ -18,6 +18,7 @@ MAIN_MENU = """\
 3) Call custom API method
 4) Remove all messages in multiple conversations
 5) Export conversation to HTML
+6) Export multiple conversation to HTML
 0) Exit
 """
 
@@ -378,6 +379,30 @@ def _run_bulk_delete(manager: VKMessageManager) -> None:
     print(f"\nDone. Total deleted: {total} message(s) in {_format_duration(elapsed)}.")
 
 
+def _export_conversation(manager: VKMessageManager, peer_id: int, count: int) -> None:
+    start = time.monotonic()
+    progress = _make_progress_printer("Fetched")
+    try:
+        path, exported = manager.export_conversation_html(
+            peer_id,
+            limit=count,
+            save_attachments=False,
+            progress=progress,
+        )
+    except NotImplementedError as err:
+        print(err)
+        return
+    except VKAPIError as err:
+        print(f"VK API error: {err}")
+        return
+    except requests.RequestException as err:
+        print(f"Network error: {err}")
+        return
+
+    elapsed = time.monotonic() - start
+    print(f"Exported {exported} message(s) to {path} in {_format_duration(elapsed)}.")
+
+
 def _run_export(manager: VKMessageManager) -> None:
     """Export a whole conversation (or its last N messages) to an HTML file.
 
@@ -398,25 +423,46 @@ def _run_export(manager: VKMessageManager) -> None:
         return
 
     count = _prompt_export_count()
+    _export_conversation(manager, peer_id, count)
 
-    start = time.monotonic()
-    progress = _make_progress_printer("Fetched")
-    try:
-        path, exported = manager.export_conversation_html(
-            peer_id, limit=count, save_attachments=False, progress=progress
+
+def _run_bulk_export(manager: VKMessageManager) -> None:
+    peers: dict[int, str] = {}  # peer_id: name
+    print("Enter conversation peer IDs one at a time.\nSubmit an empty line to finish.")
+    while True:
+        raw = input("  Peer ID (empty to finish): ").strip()
+        if not raw:
+            break
+        try:
+            peer_id = int(raw)
+            name = manager.get_conversation_name(peer_id)
+            peers[peer_id] = name
+        except ValueError:
+            print(f"Wrong peer ID: {raw}")
+
+    if not peers:
+        print("No conversations specified. Cancelled.")
+        return
+
+    print("Selected conversations:")
+    for index, (pid, pname) in enumerate(peers.items()):
+        print(f"{index:>2}. [{pid}], {pname}")
+
+    confirm = (
+        input(
+            f"\nThis will export your messages from {len(peers)} "
+            "conversation(s). Type 'yes' to confirm: "
         )
-    except NotImplementedError as err:
-        print(err)
-        return
-    except VKAPIError as err:
-        print(f"VK API error: {err}")
-        return
-    except requests.RequestException as err:
-        print(f"Network error: {err}")
+        .strip()
+        .lower()
+    )
+    if confirm != "yes":
+        print("Cancelled.")
         return
 
-    elapsed = time.monotonic() - start
-    print(f"Exported {exported} message(s) to {path} in {_format_duration(elapsed)}.")
+    for peer_id, peer_name in peers.items():
+        print(f"\nExporting {peer_name}...")
+        _export_conversation(manager, peer_id, count=EXPORT_ALL) 
 
 
 def _run(manager: VKMessageManager) -> None:
@@ -454,6 +500,8 @@ def _run(manager: VKMessageManager) -> None:
                 _run_bulk_delete(manager)
             case "5":
                 _run_export(manager)
+            case "6":
+                _run_bulk_export(manager)
             case "0":
                 print("Bye.")
                 return
